@@ -158,8 +158,13 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('chatHistory')
-  async getChatHistory(client: Socket, payload: { search?: string }) {
+  async getChatHistory(
+    client: Socket,
+    payload: { search?: string; page?: number; limit?: number },
+  ) {
     const search = payload.search || '';
+    const page = payload.page || 1;
+    const limit = payload.limit || 10;
     const chatId = client.handshake.query.chat_id as string;
 
     if (!chatId) {
@@ -168,8 +173,13 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
 
     const chatObjectId = new Types.ObjectId(chatId);
+    const pageNumber = Number(page) || 1;
+    const pageLimit = Number(limit) || 10;
+    const skip = (pageNumber - 1) * pageLimit;
 
-    Logger.log(`Fetching chat history for chat_id: ${chatObjectId.toString()}`);
+    Logger.log(
+      `Fetching chat history for chat_id: ${chatObjectId.toString()}, page: ${pageNumber}, limit: ${pageLimit}`,
+    );
 
     try {
       const matchStage: ChatMatchStage = {
@@ -186,7 +196,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       const pipeline: PipelineStage[] = [
         { $match: matchStage },
 
-        { $sort: { createdAt: 1 } },
+        { $sort: { createdAt: -1 } },
 
         {
           $lookup: {
@@ -260,27 +270,40 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         },
 
         {
-          $project: {
-            _id: 1,
-            chat_id: 1,
-            message: 1,
-            status: 1,
-            type: 1,
-            image: 1,
-            isImage: 1,
-            createdAt: 1,
-            sender_id: 1,
-            senderDetails: {
-              full_name: 1,
-              profile_image: 1,
-            },
-            senderId: '$receiverParticipantData.user_id',
-            receiver_id: '$senderParticipantData.user_id',
+          $facet: {
+            paginatedResults: [
+              {
+                $project: {
+                  _id: 1,
+                  chat_id: 1,
+                  message: 1,
+                  status: 1,
+                  type: 1,
+                  image: 1,
+                  isImage: 1,
+                  createdAt: 1,
+                  sender_id: 1,
+                  senderDetails: {
+                    full_name: 1,
+                    profile_image: 1,
+                  },
+                  senderId: '$receiverParticipantData.user_id',
+                  receiver_id: '$senderParticipantData.user_id',
+                },
+              },
+              { $skip: skip },
+              { $limit: pageLimit },
+            ],
+            totalCount: [{ $count: 'count' }],
           },
         },
       ];
 
-      const messages = await this.messageModel.aggregate(pipeline);
+      const [result] = await this.messageModel.aggregate(pipeline);
+
+      const paginatedMessages = result?.paginatedResults ?? [];
+      const totalItems = result?.totalCount?.[0]?.count ?? 0;
+
       // mark messages as read
       await this.messageModel.updateMany(
         {
@@ -290,7 +313,14 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         { $set: { status: MessageStatus.READ } },
       );
 
-      client.emit('chatHistory', messages);
+      client.emit('chatHistory', {
+        items: paginatedMessages,
+        totalCount: totalItems,
+        itemsCount: paginatedMessages.length,
+        currentPage: pageNumber,
+        totalPage: Math.ceil(totalItems / pageLimit),
+        pageSize: pageLimit,
+      });
     } catch (error) {
       Logger.error('Error fetching chat history', error);
       client.emit('chatHistoryError', 'Failed to fetch chat history');
