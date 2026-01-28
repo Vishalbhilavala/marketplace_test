@@ -1,0 +1,204 @@
+#!/bin/bash
+ 
+set -e
+set -o pipefail
+ 
+echo "🔍 Running pre-commit checks..."
+ 
+ALL_STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
+echo "📂 All staged files:"
+echo "$ALL_STAGED_FILES"
+ 
+LINT_FILES=$(echo "$ALL_STAGED_FILES" | grep -E '\\.(ts|js|tsx|jsx)$' || true)
+echo "📁 Lintable files:"
+echo "$LINT_FILES"
+ 
+ESLINT_EXIT_CODE=0
+TSC_EXIT_CODE=0
+CONSOLE_LOG_ERRORS=0
+ANY_TYPE_ERRORS=0
+COMMIT_MSG_ERRORS=0
+UNUSED_EXPORT_ERRORS=0
+SECRETS_FOUND=0
+SONAR_ISSUES_FOUND=0
+TESTS_EXIT_CODE=0
+BUILD_EXIT_CODE=0
+ 
+# Added:
+FORMAT_EXIT_CODE=0
+SPELL_EXIT_CODE=0
+ 
+ 
+echo "🔧 Running ESLint on staged JS/TS files with --max-warnings=0..."
+ 
+ALL_LINT_FILES=$(git ls-files | grep -E '\\.(ts|js|tsx|jsx)$' | grep -v '^dist/' | grep -v 'eslint.config.js' | grep -v 'commitlint.config.ts' || true)
+ 
+if [ -n "$ALL_LINT_FILES" ]; then
+  echo "🔧 Running ESLint on all JS/TS files in the repo with --max-warnings=0..."
+  npx eslint $ALL_LINT_FILES --max-warnings=0 --no-warn-ignored || ESLINT_EXIT_CODE=$?
+else
+  echo "ℹ️ No JS/TS files found in repo for linting."
+fi
+ 
+ 
+  ### 3. Check for console.log ###
+echo "🔎 Searching for console.log in project files..."
+CONSOLE_LOG_OUTPUT=$(grep -rnw --include="*.ts" --include="*.js" --include="*.tsx" --include="*.jsx" "console.log" ./src || true)
+if [ -n "$CONSOLE_LOG_OUTPUT" ]; then
+  echo "❌ console.log found:"
+  echo "$CONSOLE_LOG_OUTPUT"
+  CONSOLE_LOG_ERRORS=1
+else
+  echo "✅ No console.log found."
+fi
+ 
+ 
+### 4. Check for usage of 'any' ###
+echo "🔎 Searching for usage of 'any' type in project files..."
+ 
+ANY_USAGE=$(grep -Pnr --include="*.ts" --include="*.tsx" --exclude-dir="node_modules" '(?<!\/[/*]\s*)[:<]\s*any\b' ./src || true)
+ 
+if [ -n "$ANY_USAGE" ]; then
+  # Filter out lines where any usage is explicitly disabled
+  FILTERED=$(echo "$ANY_USAGE" | grep -vE 'eslint-disable|ts-ignore|@ts-expect-error')
+ 
+  if [ -n "$FILTERED" ]; then
+    echo "❌ 'any' type usage found (excluding ignored lines):"
+    echo "$FILTERED"
+    ANY_TYPE_ERRORS=1
+  else
+    echo "✅ All 'any' type usage is explicitly ignored."
+  fi
+else
+  echo "✅ No usage of 'any' type found."
+fi
+ 
+ 
+### Added: Prettier formatting check ###
+echo "🧹 Checking code formatting with Prettier..."
+npx prettier --check . || FORMAT_EXIT_CODE=$?
+ 
+if [ $FORMAT_EXIT_CODE -ne 0 ]; then
+  echo "❌ Prettier formatting issues found!"
+else
+  echo "✅ Prettier formatting clean."
+fi
+ 
+ 
+### Added: Spell check ###
+if command -v cspell >/dev/null 2>&1; then
+  echo "🔤 Running spell check (cspell)..."
+  npx cspell "**/*.{ts,tsx,js,jsx,json,md}" || SPELL_EXIT_CODE=$?
+ 
+  if [ $SPELL_EXIT_CODE -ne 0 ]; then
+    echo "❌ Spelling issues found!"
+  else
+    echo "✅ No spelling issues detected."
+  fi
+else
+  echo "⚠️ cspell not installed. Skipping spell check."
+  SPELL_EXIT_CODE=0
+fi
+ 
+ 
+### 6. Run TypeScript compilation check (structural errors) ###
+echo "🔧 Checking for TypeScript structural issues..."
+npx tsc --noEmit || TSC_EXIT_CODE=$?
+if [ $TSC_EXIT_CODE -ne 0 ]; then
+  echo "❌ TypeScript found structural errors!"
+else
+  echo "✅ TypeScript structure valid."
+fi
+ 
+### 7. Secret detection with git-secrets ###
+if command -v git-secrets >/dev/null 2>&1; then
+  echo "🔒 Running git-secrets scan..."
+  if ! git secrets --scan; then
+    echo "❌ Potential secrets detected!"
+    SECRETS_FOUND=1
+  else
+    echo "✅ No secrets detected."
+  fi
+else
+  echo "⚠️ git-secrets not installed. Skipping secrets check."
+fi
+ 
+### 8. SonarScanner Check ###
+echo "📡 Running SonarScanner..."
+sonar-scanner > sonar_output.txt || true
+ 
+if grep -qE "(BUG|VULNERABILITY|CODE_SMELL)" sonar_output.txt; then
+  echo "❌ Sonar issues detected in the code!"
+  grep -E "(BUG|VULNERABILITY|CODE_SMELL)" sonar_output.txt
+  SONAR_ISSUES_FOUND=1
+else
+  echo "✅ No Sonar issues detected."
+  SONAR_ISSUES_FOUND=0
+fi
+ 
+# ### 9. Run all test cases ###
+# TEST_FAILED=0
+# TEST_FILES=$(git ls-files | grep -E '\\.(test|spec)\\.(ts|js|tsx|jsx)$' || true)
+ 
+# ### 9. Run all test cases ###
+# if [ -z "$TEST_FILES" ]; then
+#   echo "⚠️ No test files found. Skipping test run."
+# else
+#   for test_file in $TEST_FILES; do
+#     echo "➡️ Running test: $test_file"
+#     npx jest "$test_file" --passWithNoTests
+#     if [ $? -ne 0 ]; then
+#       echo "❌ Failed: $test_file"
+#       TEST_FAILED=1
+#     else
+#       echo "✅ Passed: $test_file"
+#     fi
+#   done
+ 
+#   if [ $TEST_FAILED -ne 0 ]; then
+#     echo "🚫 One or more tests failed. Commit aborted!"
+#     exit 1
+#   else
+#     echo "✅ All tests passed. Proceeding with commit."
+#   fi
+# fi
+ 
+ 
+### 9. Run all test cases (block commit on failure) ###
+# echo "🧪 Running full test suite..."
+# npm test --silent || TESTS_EXIT_CODE=$?
+# if [ $TESTS_EXIT_CODE -ne 0 ]; then
+#   echo "🚫 Tests failed. Commit aborted!"
+# fi
+ 
+ 
+### 10. Run build ###
+echo "🏗️ Building the project..."
+npm run build || BUILD_EXIT_CODE=$?
+if [ $BUILD_EXIT_CODE -ne 0 ]; then
+  echo "❌ Build failed!"
+else
+  echo "✅ Build successful."
+fi
+ 
+ 
+### ✅ Final decision ###
+if [ $ESLINT_EXIT_CODE -ne 0 ] || \
+   [ $TSC_EXIT_CODE -ne 0 ] || \
+   [ $CONSOLE_LOG_ERRORS -ne 0 ] || \
+   [ $ANY_TYPE_ERRORS -ne 0 ] || \
+   [ $COMMIT_MSG_ERRORS -ne 0 ] || \
+   [ $UNUSED_EXPORT_ERRORS -ne 0 ] || \
+   [ $SONAR_ISSUES_FOUND -ne 0 ] || \
+   [ $TESTS_EXIT_CODE -ne 0 ] || \
+   [ $BUILD_EXIT_CODE -ne 0 ] || \
+   [ $SECRETS_FOUND -ne 0 ] || \
+   [ $FORMAT_EXIT_CODE -ne 0 ] || \
+   [ $SPELL_EXIT_CODE -ne 0 ]; then
+ 
+  echo "❌ Commit blocked due to pre-commit errors."
+  exit 1
+fi
+ 
+echo "✅ All checks passed. Proceeding with commit."
+exit 0
